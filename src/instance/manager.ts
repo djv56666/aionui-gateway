@@ -1,12 +1,4 @@
-/**
- * Instance Manager — spawns, tracks and recycles AionUi server instances.
- *
- * Each user gets a dedicated child process running dist-server/server.mjs
- * with its own PORT and DATA_DIR.
- */
-
-import { spawn, type ChildProcess } from 'node:child_process';
-import fs from 'node:fs';
+import { execSync, exec } from 'node:child_process';
 import path from 'node:path';
 import net from 'node:net';
 import { config } from '../config/index.js';
@@ -20,13 +12,34 @@ import {
 } from '../database/index.js';
 import type { UserInstance } from '../types/index.js';
 
-// In-memory child process references (DB stores metadata, this holds the live handle)
-const processes = new Map<string, ChildProcess>();
-
-// In-memory AionUi session tokens (obtained via gateway-login)
+const CONTAINER_PREFIX = 'aionui-gw-';
 const instanceTokens = new Map<string, string>();
 
-// ─── Port allocation ──────────────────────────────────
+function containerName(userId: string): string {
+  return `${CONTAINER_PREFIX}${userId.substring(0, 12)}`;
+}
+
+function docker(cmd: string): string {
+  return execSync(`${config.dockerCmd} ${cmd}`, { encoding: 'utf8', timeout: 30_000 }).trim();
+}
+
+function dockerAsync(cmd: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    exec(`${config.dockerCmd} ${cmd}`, { encoding: 'utf8', timeout: 30_000 }, (err, stdout) => {
+      if (err) reject(err);
+      else resolve(stdout.trim());
+    });
+  });
+}
+
+function isContainerRunning(name: string): boolean {
+  try {
+    const state = docker(`inspect --format '{{.State.Running}}' ${name}`);
+    return state === 'true';
+  } catch {
+    return false;
+  }
+}
 
 function allocatePort(): number {
   const allocated = getAllocatedPorts();
@@ -36,129 +49,98 @@ function allocatePort(): number {
   throw new Error('No available ports in the configured range');
 }
 
-// ─── Health check ─────────────────────────────────────
-
-function waitForReady(port: number, timeoutMs = 30_000): Promise<void> {
+function waitForReady(port: number, timeoutMs = 60_000): Promise<void> {
   return new Promise((resolve, reject) => {
     const start = Date.now();
-
     const check = () => {
       if (Date.now() - start > timeoutMs) {
-        reject(new Error(`Instance on port ${port} did not become ready within ${timeoutMs}ms`));
+        reject(new Error(`Container on port ${port} did not become ready within ${timeoutMs}ms`));
         return;
       }
-
       const socket = net.createConnection({ host: '127.0.0.1', port }, () => {
         socket.destroy();
         resolve();
       });
-
       socket.on('error', () => {
         socket.destroy();
-        setTimeout(check, 500);
+        setTimeout(check, 1000);
       });
     };
-
     check();
   });
 }
 
-// ─── Spawn ────────────────────────────────────────────
+function ensureDockerAvailable(): void {
+  try {
+    docker('version');
+  } catch {
+    throw new Error(`${config.dockerCmd} is not available. Please ensure ${config.dockerCmd} is installed and running.`);
+  }
+}
 
 export async function ensureInstance(userId: string, username?: string): Promise<number> {
-  // 1. Check if already running (in-memory process still alive)
   const existing = getInstanceByUserId(userId);
-  if (existing && existing.status === 'running' && processes.has(userId)) {
+  const name = containerName(userId);
+
+  if (existing && existing.status === 'running' && isContainerRunning(name)) {
     updateInstanceActivity(userId);
     return existing.port;
   }
 
-  // 2. If DB says running but process is dead, clean up
-  if (existing && processes.has(userId)) {
-    const proc = processes.get(userId)!;
-    if (proc.exitCode !== null || proc.killed) {
-      processes.delete(userId);
-      updateInstanceStatus(userId, 'stopped');
-    } else {
-      // Process exists and didn't exit — it's alive
-      updateInstanceStatus(userId, 'running');
-      updateInstanceActivity(userId);
-      return existing.port;
+  if (existing) {
+    try {
+      if (isContainerRunning(name)) {
+        docker(`stop ${name}`);
+      }
+      docker(`rm ${name}`);
+    } catch {
+      // Container may not exist
     }
   }
 
-  // 3. Spawn new instance
   const port = existing?.port || allocatePort();
   const dataDir = path.join(config.instanceDataRoot, userId);
 
-  // Ensure data directory exists
-  if (!fs.existsSync(dataDir)) {
-    fs.mkdirSync(dataDir, { recursive: true });
+  console.log(`[instance] Starting container ${name} for user ${userId} on port ${port}`);
+
+  const containerInternalPort = config.containerPort;
+  const runArgs = [
+    'run', '-d',
+    '--name', name,
+    '-p', `${port}:${containerInternalPort}`,
+    '-v', `${dataDir}:/data`,
+    '-e', `PORT=${containerInternalPort}`,
+    '-e', 'NODE_ENV=production',
+    '-e', 'ALLOW_REMOTE=false',
+    '-e', `GATEWAY_SECRET=${config.gatewaySecret}`,
+    '--memory=512m',
+    '--cpus=1',
+    '--pids-limit=256',
+    config.dockerImage,
+  ];
+
+  try {
+    docker(runArgs.join(' '));
+  } catch (err) {
+    console.error(`[instance] Failed to start container:`, err);
+    throw new Error(`Failed to start Docker container for user ${userId}`);
   }
-
-  console.log(`[instance] Spawning AionUi for user ${userId} on port ${port}, data: ${dataDir}`);
-
-  const runtime = config.instanceRuntime;
-  const args = runtime.endsWith('bun') ? ['run', config.aionuiServerEntry] : [config.aionuiServerEntry];
-
-  // cwd must be the AionUi project root so getAppPath() (= process.cwd())
-  // can locate out/renderer/index.html for serving static assets.
-  const aionuiRoot = path.dirname(path.dirname(config.aionuiServerEntry));
-
-  const child = spawn(runtime, args, {
-    cwd: aionuiRoot,
-    env: {
-      ...process.env,
-      PORT: String(port),
-      DATA_DIR: dataDir,
-      ALLOW_REMOTE: 'false',
-      NODE_ENV: 'production',
-      GATEWAY_SECRET: config.gatewaySecret,
-    },
-    stdio: ['ignore', 'pipe', 'pipe'],
-    detached: false,
-  });
-
-  // Pipe child stdout/stderr with prefix
-  const prefix = `[user:${userId.substring(0, 8)}]`;
-  child.stdout?.on('data', (data: Buffer) => {
-    const lines = data.toString().trimEnd().split('\n');
-    for (const line of lines) {
-      console.log(`${prefix} ${line}`);
-    }
-  });
-  child.stderr?.on('data', (data: Buffer) => {
-    const lines = data.toString().trimEnd().split('\n');
-    for (const line of lines) {
-      console.error(`${prefix} ${line}`);
-    }
-  });
 
   const now = Date.now();
   const instance: UserInstance = {
     userId,
     port,
-    pid: child.pid || 0,
+    pid: 0,
     status: 'starting',
     lastActive: now,
     startedAt: now,
   };
-
-  processes.set(userId, child);
   upsertInstance(instance);
 
-  // Handle unexpected exit
-  child.on('exit', (code, signal) => {
-    console.log(`[instance] User ${userId} instance exited: code=${code}, signal=${signal}`);
-    processes.delete(userId);
-    updateInstanceStatus(userId, 'stopped');
-  });
-
-  // Wait for the server to accept connections
   try {
-    await waitForReady(port);
+    await waitForReady(port, 60_000);
     updateInstanceStatus(userId, 'running');
-    console.log(`[instance] User ${userId} instance ready on port ${port}`);
+    console.log(`[instance] Container ${name} ready on port ${port}`);
 
     if (username && config.gatewaySecret) {
       try {
@@ -179,60 +161,59 @@ export async function ensureInstance(userId: string, username?: string): Promise
       }
     }
   } catch (err) {
-    console.error(`[instance] User ${userId} instance failed to start:`, err);
-    killInstance(userId);
+    console.error(`[instance] Container ${name} failed to start:`, err);
+    stopContainer(name);
+    updateInstanceStatus(userId, 'stopped');
     throw err;
   }
 
   return port;
 }
 
-// ─── Kill ─────────────────────────────────────────────
-
-export function killInstance(userId: string): void {
-  const proc = processes.get(userId);
-  if (proc && proc.exitCode === null && !proc.killed) {
-    console.log(`[instance] Killing instance for user ${userId}`);
-    proc.kill('SIGTERM');
-
-    // Force kill after 5 seconds
-    setTimeout(() => {
-      if (!proc.killed && proc.exitCode === null) {
-        proc.kill('SIGKILL');
-      }
-    }, 5000).unref();
+function stopContainer(name: string): void {
+  try {
+    docker(`stop ${name}`);
+  } catch {
+    // Ignore
   }
-
-  processes.delete(userId);
-  updateInstanceStatus(userId, 'stopped');
+  try {
+    docker(`rm ${name}`);
+  } catch {
+    // Ignore
+  }
 }
 
-// ─── Idle reaper ──────────────────────────────────────
+export function killInstance(userId: string): void {
+  const name = containerName(userId);
+  console.log(`[instance] Stopping container ${name} for user ${userId}`);
+  stopContainer(name);
+  updateInstanceStatus(userId, 'stopped');
+  instanceTokens.delete(userId);
+}
 
 let reaperTimer: ReturnType<typeof setInterval> | null = null;
 
 export function startIdleReaper(): void {
+  ensureDockerAvailable();
+
   if (reaperTimer) return;
 
   reaperTimer = setInterval(() => {
     const now = Date.now();
     const running = getRunningInstances();
-
     for (const instance of running) {
       const idle = now - instance.lastActive;
       if (idle > config.instanceIdleTimeout) {
         console.log(
-          `[reaper] Recycling idle instance for user ${instance.userId} (idle ${Math.round(idle / 1000)}s)`,
+          `[reaper] Recycling idle container for user ${instance.userId} (idle ${Math.round(idle / 1000)}s)`,
         );
         killInstance(instance.userId);
       }
     }
-  }, 60_000); // Check every minute
+  }, 60_000);
 
   reaperTimer.unref();
-  console.log(
-    `[reaper] Idle reaper started (timeout: ${config.instanceIdleTimeout / 1000}s)`,
-  );
+  console.log(`[reaper] Idle reaper started (timeout: ${config.instanceIdleTimeout / 1000}s)`);
 }
 
 export function stopIdleReaper(): void {
@@ -242,26 +223,34 @@ export function stopIdleReaper(): void {
   }
 }
 
-// ─── Touch (update activity) ──────────────────────────
-
 export function touchInstance(userId: string): void {
-  if (processes.has(userId)) {
+  const name = containerName(userId);
+  if (isContainerRunning(name)) {
     updateInstanceActivity(userId);
   }
 }
-
-// ─── Get instance token (for cookie injection) ────────
 
 export function getInstanceToken(userId: string): string | null {
   return instanceTokens.get(userId) || null;
 }
 
-// ─── Shutdown all ─────────────────────────────────────
-
 export function shutdownAll(): void {
   stopIdleReaper();
-  for (const userId of processes.keys()) {
-    killInstance(userId);
+  try {
+    const output = docker(`ps --filter name=${CONTAINER_PREFIX} -q`);
+    if (output) {
+      const ids = output.split('\n').filter(Boolean);
+      for (const id of ids) {
+        try {
+          docker(`stop ${id}`);
+          docker(`rm ${id}`);
+        } catch {
+          // Ignore
+        }
+      }
+    }
+  } catch {
+    // Ignore
   }
   instanceTokens.clear();
 }
