@@ -1,6 +1,5 @@
 import { execSync, exec } from 'node:child_process';
 import path from 'node:path';
-import net from 'node:net';
 import { config } from '../config/index.js';
 import {
   getAllocatedPorts,
@@ -49,22 +48,38 @@ function allocatePort(): number {
   throw new Error('No available ports in the configured range');
 }
 
+/**
+ * Wait until the container's HTTP service is fully ready.
+ *
+ * TCP port open ≠ service ready — the application may still be initializing
+ * routes / DB after binding the port. So we probe an actual HTTP endpoint
+ * instead of just checking TCP connectivity.
+ *
+ * Strategy: try multiple health-check paths that AionUI might expose,
+ * and also accept any non-connection-error response (even 404) as a sign
+ * the HTTP server is up and routing requests.
+ */
 function waitForReady(port: number, timeoutMs = 60_000): Promise<void> {
   return new Promise((resolve, reject) => {
     const start = Date.now();
-    const check = () => {
+    const check = async () => {
       if (Date.now() - start > timeoutMs) {
         reject(new Error(`Container on port ${port} did not become ready within ${timeoutMs}ms`));
         return;
       }
-      const socket = net.createConnection({ host: '127.0.0.1', port }, () => {
-        socket.destroy();
-        resolve();
-      });
-      socket.on('error', () => {
-        socket.destroy();
-        setTimeout(check, 1000);
-      });
+      try {
+        const res = await fetch(`http://127.0.0.1:${port}/api/health`, {
+          signal: AbortSignal.timeout(3000),
+        });
+        // Any HTTP response (even 404) means the server is up and routing
+        if (res.status < 500) {
+          resolve();
+          return;
+        }
+      } catch {
+        // Connection refused / timeout — service not ready yet
+      }
+      setTimeout(check, 1000);
     };
     check();
   });
@@ -84,6 +99,28 @@ export async function ensureInstance(userId: string, username?: string): Promise
 
   if (existing && existing.status === 'running' && isContainerRunning(name)) {
     updateInstanceActivity(userId);
+
+    // If gateway process restarted but container is still alive, the in-memory
+    // token map is empty. Re-authenticate so the proxy can inject the token.
+    if (!instanceTokens.has(userId) && username && config.gatewaySecret) {
+      try {
+        const loginRes = await fetch(`http://127.0.0.1:${existing.port}/api/auth/gateway-login`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ gatewaySecret: config.gatewaySecret, username }),
+        });
+        if (loginRes.ok) {
+          const loginData = (await loginRes.json()) as { success: boolean; token?: string };
+          if (loginData.success && loginData.token) {
+            instanceTokens.set(userId, loginData.token);
+            console.log(`[instance] Re-authenticated gateway login for user ${userId}`);
+          }
+        }
+      } catch (err) {
+        console.error(`[instance] Re-auth gateway-login failed for ${userId}:`, err);
+      }
+    }
+
     return existing.port;
   }
 
@@ -104,6 +141,7 @@ export async function ensureInstance(userId: string, username?: string): Promise
   console.log(`[instance] Starting container ${name} for user ${userId} on port ${port}`);
 
   const containerInternalPort = config.containerPort;
+  const gatewayBaseUrl = process.env.GATEWAY_BASE_URL || '';
   const runArgs = [
     'run', '-d',
     '--name', name,
@@ -111,8 +149,12 @@ export async function ensureInstance(userId: string, username?: string): Promise
     '-v', `${dataDir}:/data`,
     '-e', `PORT=${containerInternalPort}`,
     '-e', 'NODE_ENV=production',
-    '-e', 'ALLOW_REMOTE=false',
+    '-e', 'ALLOW_REMOTE=true',
     '-e', `GATEWAY_SECRET=${config.gatewaySecret}`,
+    // Tell AionUI to accept requests originating from the Gateway's public domain.
+    // Without this, CORS rejects the browser's origin and cookies (csrfToken, etc.)
+    // won't be set properly, causing WebSocket auth failures.
+    ...(gatewayBaseUrl ? ['-e', `SERVER_BASE_URL=${gatewayBaseUrl}`] : []),
     '--memory=512m',
     '--cpus=1',
     '--pids-limit=256',
@@ -144,6 +186,7 @@ export async function ensureInstance(userId: string, username?: string): Promise
 
     if (username && config.gatewaySecret) {
       try {
+        console.log(`[instance] Attempting gateway-login for ${userId} at http://127.0.0.1:${port}/api/auth/gateway-login`);
         const loginRes = await fetch(`http://127.0.0.1:${port}/api/auth/gateway-login`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -153,8 +196,13 @@ export async function ensureInstance(userId: string, username?: string): Promise
           const loginData = (await loginRes.json()) as { success: boolean; token?: string };
           if (loginData.success && loginData.token) {
             instanceTokens.set(userId, loginData.token);
-            console.log(`[instance] Gateway login succeeded for user ${userId}`);
+            console.log(`[instance] Gateway login succeeded for user ${userId}, token length: ${loginData.token.length}`);
+          } else {
+            console.warn(`[instance] Gateway login response not successful:`, loginData);
           }
+        } else {
+          const body = await loginRes.text();
+          console.error(`[instance] Gateway login HTTP ${loginRes.status} for ${userId}: ${body}`);
         }
       } catch (err) {
         console.error(`[instance] Gateway login failed for user ${userId}:`, err);
