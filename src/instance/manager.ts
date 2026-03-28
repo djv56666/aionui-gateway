@@ -1,5 +1,6 @@
 import { execSync, exec } from 'node:child_process';
 import path from 'node:path';
+import { mkdirSync } from 'node:fs';
 import { config } from '../config/index.js';
 import {
   getAllocatedPorts,
@@ -137,6 +138,10 @@ export async function ensureInstance(userId: string, username?: string): Promise
 
   const port = existing?.port || allocatePort();
   const dataDir = path.join(config.instanceDataRoot, userId);
+
+  // Ensure the user data directory exists before mounting it into the container.
+  // Podman (unlike Docker) does not auto-create host bind-mount paths.
+  mkdirSync(dataDir, { recursive: true });
 
   console.log(`[instance] Starting container ${name} for user ${userId} on port ${port}`);
 
