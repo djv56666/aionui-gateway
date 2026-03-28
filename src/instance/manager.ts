@@ -15,12 +15,32 @@ import type { UserInstance } from '../types/index.js';
 const CONTAINER_PREFIX = 'aionui-gw-';
 const instanceTokens = new Map<string, string>();
 
+/**
+ * Per-user lock map to prevent concurrent ensureInstance() calls from racing.
+ * When multiple requests arrive for the same user simultaneously, only the
+ * first one actually creates/starts the container — the rest await the same
+ * Promise and reuse the result.
+ */
+const ensureLocks = new Map<string, Promise<number>>();
+
+/**
+ * In-memory set of user IDs whose containers are confirmed running.
+ * This avoids calling `docker inspect` (slow sync subprocess) on every
+ * request. Populated when a container starts successfully; cleared on
+ * stop/kill/reaper.
+ */
+const runningUsers = new Set<string>();
+
 function containerName(userId: string): string {
   return `${CONTAINER_PREFIX}${userId.substring(0, 12)}`;
 }
 
-function docker(cmd: string): string {
-  return execSync(`${config.dockerCmd} ${cmd}`, { encoding: 'utf8', timeout: 30_000 }).trim();
+function docker(cmd: string, options?: { quiet?: boolean }): string {
+  return execSync(`${config.dockerCmd} ${cmd}`, {
+    encoding: 'utf8',
+    timeout: 30_000,
+    stdio: ['pipe', 'pipe', options?.quiet ? 'pipe' : 'inherit'],
+  }).trim();
 }
 
 function dockerAsync(cmd: string): Promise<string> {
@@ -95,45 +115,62 @@ function ensureDockerAvailable(): void {
 }
 
 export async function ensureInstance(userId: string, username?: string): Promise<number> {
+  // If there's already a pending ensure for this user, piggyback on it.
+  const pending = ensureLocks.get(userId);
+  if (pending) return pending;
+
+  const promise = ensureInstanceInner(userId, username).finally(() => {
+    ensureLocks.delete(userId);
+  });
+
+  ensureLocks.set(userId, promise);
+  return promise;
+}
+
+async function ensureInstanceInner(userId: string, username?: string): Promise<number> {
   const existing = getInstanceByUserId(userId);
   const name = containerName(userId);
 
-  if (existing && existing.status === 'running' && isContainerRunning(name)) {
-    updateInstanceActivity(userId);
+  // Fast path: if in-memory cache says running, trust it (avoids slow docker inspect).
+  // Fall back to docker inspect only when the cache entry is missing (e.g. process restarted).
+  if (existing && existing.status === 'running') {
+    if (runningUsers.has(userId) || isContainerRunning(name)) {
+      updateInstanceActivity(userId);
+      runningUsers.add(userId);
 
-    // If gateway process restarted but container is still alive, the in-memory
-    // token map is empty. Re-authenticate so the proxy can inject the token.
-    if (!instanceTokens.has(userId) && username && config.gatewaySecret) {
-      try {
-        const loginRes = await fetch(`http://127.0.0.1:${existing.port}/api/auth/gateway-login`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ gatewaySecret: config.gatewaySecret, username }),
-        });
-        if (loginRes.ok) {
-          const loginData = (await loginRes.json()) as { success: boolean; token?: string };
-          if (loginData.success && loginData.token) {
-            instanceTokens.set(userId, loginData.token);
-            console.log(`[instance] Re-authenticated gateway login for user ${userId}`);
+      // If gateway process restarted but container is still alive, the in-memory
+      // token map is empty. Re-authenticate so the proxy can inject the token.
+      if (!instanceTokens.has(userId) && username && config.gatewaySecret) {
+        try {
+          const loginRes = await fetch(`http://127.0.0.1:${existing.port}/api/auth/gateway-login`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ gatewaySecret: config.gatewaySecret, username }),
+          });
+          if (loginRes.ok) {
+            const loginData = (await loginRes.json()) as { success: boolean; token?: string };
+            if (loginData.success && loginData.token) {
+              instanceTokens.set(userId, loginData.token);
+              console.log(`[instance] Re-authenticated gateway login for user ${userId}`);
+            }
           }
+        } catch (err) {
+          console.error(`[instance] Re-auth gateway-login failed for ${userId}:`, err);
         }
-      } catch (err) {
-        console.error(`[instance] Re-auth gateway-login failed for ${userId}:`, err);
       }
-    }
 
-    return existing.port;
+      return existing.port;
+    }
+    // DB says running but container is dead — stale record, will recreate below.
+    console.log(`[instance] Stale record for ${userId} (DB=running, container=dead), recreating`);
   }
 
-  if (existing) {
-    try {
-      if (isContainerRunning(name)) {
-        docker(`stop ${name}`);
-      }
-      docker(`rm ${name}`);
-    } catch {
-      // Container may not exist
-    }
+  // Clean up any existing container with the same name, whether tracked in DB or not.
+  // Using `rm -f` ensures removal even if stop fails (e.g. container in weird state).
+  try {
+    docker(`rm -f ${name}`, { quiet: true });
+  } catch {
+    // Container does not exist — nothing to clean up
   }
 
   const port = existing?.port || allocatePort();
@@ -187,6 +224,7 @@ export async function ensureInstance(userId: string, username?: string): Promise
   try {
     await waitForReady(port, 60_000);
     updateInstanceStatus(userId, 'running');
+    runningUsers.add(userId);
     console.log(`[instance] Container ${name} ready on port ${port}`);
 
     if (username && config.gatewaySecret) {
@@ -215,6 +253,7 @@ export async function ensureInstance(userId: string, username?: string): Promise
     }
   } catch (err) {
     console.error(`[instance] Container ${name} failed to start:`, err);
+    runningUsers.delete(userId);
     stopContainer(name);
     updateInstanceStatus(userId, 'stopped');
     throw err;
@@ -239,6 +278,7 @@ function stopContainer(name: string): void {
 export function killInstance(userId: string): void {
   const name = containerName(userId);
   console.log(`[instance] Stopping container ${name} for user ${userId}`);
+  runningUsers.delete(userId);
   stopContainer(name);
   updateInstanceStatus(userId, 'stopped');
   instanceTokens.delete(userId);
@@ -306,4 +346,5 @@ export function shutdownAll(): void {
     // Ignore
   }
   instanceTokens.clear();
+  runningUsers.clear();
 }
