@@ -63,6 +63,11 @@ export const config = {
   /** Internal port of AionUi container */
   containerPort: parseInt(envOrDefault('CONTAINER_PORT', '25808'), 10),
 
+  /** Container resource limits */
+  containerMemory: envOrDefault('CONTAINER_MEMORY', '512m'),
+  containerCpus: envOrDefault('CONTAINER_CPUS', '1'),
+  containerPidsLimit: parseInt(envOrDefault('CONTAINER_PIDS_LIMIT', '256'), 10),
+
   /** Docker/Podman command */
   dockerCmd: envOrDefault('DOCKER_CMD', 'docker'),
 

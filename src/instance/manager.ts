@@ -197,9 +197,9 @@ async function ensureInstanceInner(userId: string, username?: string): Promise<n
     // Without this, CORS rejects the browser's origin and cookies (csrfToken, etc.)
     // won't be set properly, causing WebSocket auth failures.
     ...(gatewayBaseUrl ? ['-e', `SERVER_BASE_URL=${gatewayBaseUrl}`] : []),
-    '--memory=512m',
-    '--cpus=1',
-    '--pids-limit=256',
+    '--memory', config.containerMemory,
+    '--cpus', config.containerCpus,
+    '--pids-limit', String(config.containerPidsLimit),
     config.dockerImage,
   ];
 
