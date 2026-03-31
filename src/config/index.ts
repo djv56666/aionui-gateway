@@ -49,6 +49,14 @@ export const config = {
         return !!(config.oauth.zhimi.clientId && config.oauth.zhimi.clientSecret);
       },
     },
+    feishu: {
+      clientId: 'cli_9f6ac85c246e100d',
+      clientSecret: 'i6ksW6MnaYJudoCeok7NAeaH5UfhlraY',
+      redirectUri: 'http://aionui.zhimi.com/oauth/feishu',
+      get enabled(): boolean {
+        return !!(config.oauth.feishu.clientId && config.oauth.feishu.clientSecret);
+      },
+    },
   },
 
   /** Gateway database path */
@@ -70,6 +78,12 @@ export const config = {
 
   /** Docker/Podman command */
   dockerCmd: envOrDefault('DOCKER_CMD', 'docker'),
+
+  /** Gateway server host */
+  gatewayHost: envOrDefault('GATEWAY_HOST', 'localhost'),
+
+  /** Gateway server port */
+  gatewayPort: parseInt(envOrDefault('GATEWAY_PORT', '3000'), 10),
 
   /** Project root */
   projectRoot,

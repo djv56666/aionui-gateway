@@ -13,6 +13,7 @@ import cookieSession from 'cookie-session';
 import helmet from 'helmet';
 import { config } from './config/index.js';
 import { createGatewayRouter } from './routes/gateway.js';
+import { createAgentConnectRouter } from './routes/agent-connect.js';
 import { createProxyHandler, createWsUpgradeHandler } from './proxy/index.js';
 import { requireAuth } from './middleware/auth.js';
 import { startIdleReaper, shutdownAll } from './instance/manager.js';
@@ -51,6 +52,10 @@ app.use('/gateway', createGatewayRouter());
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', uptime: process.uptime() });
 });
+
+// ─── Agent Connect API (orchestration for remote ACP)
+
+app.use('/api/agent', requireAuth, createAgentConnectRouter());
 
 // ─── All other routes → proxy to user's AionUi instance
 

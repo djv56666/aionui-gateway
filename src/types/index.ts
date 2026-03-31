@@ -1,4 +1,4 @@
-export type OAuthProvider = 'github' | 'google' | 'zhimi';
+export type OAuthProvider = 'github' | 'google' | 'zhimi' | 'feishu';
 
 export interface GatewayUser {
   id: string;

@@ -72,6 +72,17 @@ function getProviderConfig(provider: OAuthProvider): OAuthProviderConfig | null 
       };
     }
 
+    case 'feishu':
+      if (!config.oauth.feishu.enabled) return null;
+      return {
+        authorizeUrl: 'https://open.feishu.cn/open-apis/auth/v3/authorize',
+        tokenUrl: 'https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal',
+        userInfoUrl: 'https://open.feishu.cn/open-apis/auth/v3/user_info',
+        scopes: ['user_info:read'],
+        clientId: config.oauth.feishu.clientId,
+        clientSecret: config.oauth.feishu.clientSecret,
+      };
+
     default:
       return null;
   }
@@ -241,6 +252,8 @@ async function normalizeUserInfo(
       return normalizeGoogle(data);
     case 'zhimi':
       return normalizeZhimi(data);
+    case 'feishu':
+      return normalizeFeishu(data);
     default:
       throw new Error(`Unknown provider: ${provider}`);
   }
@@ -310,6 +323,32 @@ function normalizeZhimi(data: Record<string, unknown>): OAuthUserInfo {
 }
 
 /**
+ * Normalize Feishu OAuth profile response.
+ * Response format: { user: { user_id: "ou_xxx", name: "张三", email: "zhangsan@example.com", avatar: { avatar_url: "https://xxx" } } }
+ */
+function normalizeFeishu(data: Record<string, unknown>): OAuthUserInfo {
+  const user = data.user as Record<string, unknown> | null;
+  if (!user) {
+    throw new Error('Invalid Feishu user response format');
+  }
+
+  const userId = user.user_id as string;
+  const email = user.email as string | null;
+  const name = user.name as string || userId;
+  const avatar = user.avatar as Record<string, unknown> | null;
+  const avatarUrl = avatar?.avatar_url as string || '';
+
+  return {
+    provider: 'feishu',
+    oauthId: userId,
+    username: email ? email.split('@')[0] : userId,
+    displayName: name,
+    avatarUrl,
+    email,
+  };
+}
+
+/**
  * Get list of enabled providers.
  */
 export function getEnabledProviders(): OAuthProvider[] {
@@ -317,5 +356,6 @@ export function getEnabledProviders(): OAuthProvider[] {
   if (config.oauth.zhimi.enabled) providers.push('zhimi');
   if (config.oauth.github.enabled) providers.push('github');
   if (config.oauth.google.enabled) providers.push('google');
+  if (config.oauth.feishu.enabled) providers.push('feishu');
   return providers;
 }
