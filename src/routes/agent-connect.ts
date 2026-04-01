@@ -284,7 +284,7 @@ export function createAgentConnectRouter(): Router {
    * Gateway signs a short-lived JWT that the ACP Bridge validates.
    */
   router.get('/:agentId/connect', async (req: Request, res: Response) => {
-    const { agentId } = req.params;
+    const agentId = req.params.agentId as string;
     const session = req.session as { userId?: string } | undefined;
     const userId = session?.userId;
 

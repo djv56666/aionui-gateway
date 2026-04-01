@@ -10,6 +10,8 @@ import crypto from 'node:crypto';
 import { config } from '../config/index.js';
 import type { OAuthProvider } from '../types/index.js';
 
+export type { OAuthProvider };
+
 // ─── Provider configurations ──────────────────────────
 
 interface OAuthProviderConfig {

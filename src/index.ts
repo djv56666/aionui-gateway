@@ -132,5 +132,7 @@ function getProviderSummary(): string {
   else providers.push('GitHub ❌');
   if (config.oauth.google.enabled) providers.push('Google ✅');
   else providers.push('Google ❌');
+  if (config.oauth.feishu.enabled) providers.push('Feishu ✅');
+  else providers.push('Feishu ❌');
   return providers.join(', ');
 }

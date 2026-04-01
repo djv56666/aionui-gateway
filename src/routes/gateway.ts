@@ -131,7 +131,7 @@ export function createGatewayRouter(): Router {
   });
 
   router.get('/loading/:agentId', (req: Request, res: Response) => {
-    const { agentId } = req.params;
+    const agentId = req.params.agentId as string;
     res.send(buildLoadingPage(agentId));
   });
 
