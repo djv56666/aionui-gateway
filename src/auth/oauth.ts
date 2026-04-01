@@ -75,10 +75,10 @@ function getProviderConfig(provider: OAuthProvider): OAuthProviderConfig | null 
     case 'feishu':
       if (!config.oauth.feishu.enabled) return null;
       return {
-        authorizeUrl: 'https://open.feishu.cn/open-apis/auth/v3/authorize',
+        authorizeUrl: 'https://open.feishu.cn/open-apis/authen/v1/authorize',
         tokenUrl: 'https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal',
-        userInfoUrl: 'https://open.feishu.cn/open-apis/auth/v3/user_info',
-        scopes: ['user_info:read'],
+        userInfoUrl: 'https://open.feishu.cn/open-apis/authen/v1/user_info',
+        scopes: [],
         clientId: config.oauth.feishu.clientId,
         clientSecret: config.oauth.feishu.clientSecret,
       };
@@ -125,6 +125,16 @@ export function buildAuthorizeUrl(
   const state = crypto.randomBytes(20).toString('hex');
   pendingStates.set(state, { provider, expiresAt: Date.now() + 10 * 60 * 1000 });
 
+  // Feishu uses app_id instead of client_id and doesn't require response_type/scope
+  if (provider === 'feishu') {
+    const params = new URLSearchParams({
+      app_id: cfg.clientId,
+      redirect_uri: callbackUrl,
+      state,
+    });
+    return { url: `${cfg.authorizeUrl}?${params.toString()}`, state };
+  }
+
   const params = new URLSearchParams({
     client_id: cfg.clientId,
     redirect_uri: callbackUrl,
@@ -170,6 +180,13 @@ export async function exchangeCodeForUser(
 ): Promise<OAuthUserInfo | null> {
   const cfg = getProviderConfig(provider);
   if (!cfg) return null;
+
+  // Feishu requires a two-step token exchange:
+  // 1) Get app_access_token
+  // 2) Use it to exchange code for user_access_token
+  if (provider === 'feishu') {
+    return exchangeFeishuCode(cfg, code);
+  }
 
   // Step 1: Exchange code for access token
   const tokenRes = await fetch(cfg.tokenUrl, {
@@ -236,6 +253,79 @@ export async function exchangeCodeForUser(
 
   // Step 3: Normalize to OAuthUserInfo
   return normalizeUserInfo(provider, userData, accessToken);
+}
+
+/**
+ * Feishu-specific two-step code exchange:
+ * 1) POST /auth/v3/tenant_access_token/internal → tenant_access_token
+ * 2) POST /authen/v1/oidc/access_token          → user_access_token
+ */
+async function exchangeFeishuCode(
+  cfg: OAuthProviderConfig,
+  code: string,
+): Promise<OAuthUserInfo | null> {
+  // Step 1: Get tenant_access_token
+  const appTokenRes = await fetch(cfg.tokenUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      app_id: cfg.clientId,
+      app_secret: cfg.clientSecret,
+    }),
+  });
+
+  if (!appTokenRes.ok) {
+    console.error(`[oauth] Feishu app_access_token failed: ${appTokenRes.status} ${await appTokenRes.text()}`);
+    return null;
+  }
+
+  const tokenData = (await appTokenRes.json()) as { code?: number; tenant_access_token?: string };
+  const tenantAccessToken = tokenData.tenant_access_token;
+  if (!tenantAccessToken) {
+    console.error('[oauth] No tenant_access_token in Feishu response:', JSON.stringify(tokenData));
+    return null;
+  }
+
+  // Step 2: Exchange code for user_access_token
+  const codeRes = await fetch('https://open.feishu.cn/open-apis/authen/v1/oidc/access_token', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${tenantAccessToken}`,
+    },
+    body: JSON.stringify({
+      grant_type: 'authorization_code',
+      code,
+    }),
+  });
+
+  if (!codeRes.ok) {
+    console.error(`[oauth] Feishu code exchange failed: ${codeRes.status} ${await codeRes.text()}`);
+    return null;
+  }
+
+  const codeData = (await codeRes.json()) as { code?: number; data?: { access_token?: string } };
+  const userAccessToken = codeData?.data?.access_token;
+  if (!userAccessToken) {
+    console.error('[oauth] No user_access_token in Feishu code exchange:', JSON.stringify(codeData));
+    return null;
+  }
+
+  // Step 3: Fetch user info with user_access_token
+  const userRes = await fetch(cfg.userInfoUrl, {
+    headers: {
+      Authorization: `Bearer ${userAccessToken}`,
+      Accept: 'application/json',
+    },
+  });
+
+  if (!userRes.ok) {
+    console.error(`[oauth] Feishu user info fetch failed: ${userRes.status}`);
+    return null;
+  }
+
+  const userData = (await userRes.json()) as Record<string, unknown>;
+  return normalizeFeishu(userData);
 }
 
 // ─── Provider-specific normalization ──────────────────
@@ -323,25 +413,22 @@ function normalizeZhimi(data: Record<string, unknown>): OAuthUserInfo {
 }
 
 /**
- * Normalize Feishu OAuth profile response.
- * Response format: { user: { user_id: "ou_xxx", name: "张三", email: "zhangsan@example.com", avatar: { avatar_url: "https://xxx" } } }
+ * Normalize Feishu v1 authen API response.
+ * Response format: { code: 0, data: { open_id, user_id, name, email, avatar_url, ... } }
  */
 function normalizeFeishu(data: Record<string, unknown>): OAuthUserInfo {
-  const user = data.user as Record<string, unknown> | null;
-  if (!user) {
-    throw new Error('Invalid Feishu user response format');
-  }
+  const userInfo = (data.data as Record<string, unknown>) || data;
 
-  const userId = user.user_id as string;
-  const email = user.email as string | null;
-  const name = user.name as string || userId;
-  const avatar = user.avatar as Record<string, unknown> | null;
-  const avatarUrl = avatar?.avatar_url as string || '';
+  const openId = userInfo.open_id as string;
+  const userId = userInfo.user_id as string;
+  const email = userInfo.email as string | null;
+  const name = (userInfo.name as string) || openId || userId;
+  const avatarUrl = (userInfo.avatar_url as string) || '';
 
   return {
     provider: 'feishu',
-    oauthId: userId,
-    username: email ? email.split('@')[0] : userId,
+    oauthId: openId || userId,
+    username: email ? email.split('@')[0] : (openId || userId),
     displayName: name,
     avatarUrl,
     email,

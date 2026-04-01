@@ -50,9 +50,8 @@ export const config = {
       },
     },
     feishu: {
-      clientId: 'cli_9f6ac85c246e100d',
-      clientSecret: 'i6ksW6MnaYJudoCeok7NAeaH5UfhlraY',
-      redirectUri: 'http://aionui.zhimi.com/oauth/feishu',
+      clientId: process.env.OAUTH_FEISHU_APP_ID || '',
+      clientSecret: process.env.OAUTH_FEISHU_APP_SECRET || '',
       get enabled(): boolean {
         return !!(config.oauth.feishu.clientId && config.oauth.feishu.clientSecret);
       },

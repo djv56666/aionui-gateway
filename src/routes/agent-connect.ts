@@ -11,7 +11,8 @@
  */
 
 import { Router, type Request, type Response } from 'express';
-import { sign } from 'jsonwebtoken';
+import jwt from 'jsonwebtoken';
+const { sign } = jwt;
 import { config } from '../config/index.js';
 import path from 'path';
 import { getBaseUrl } from '../utils/index.js';

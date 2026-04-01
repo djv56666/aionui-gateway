@@ -36,9 +36,9 @@ export function createGatewayRouter(): Router {
 
   // ─── OAuth2: Initiate flow ──────────────────────────
 
-  router.get('/auth/:provider', (req: Request, res: Response) => {
+  router.get('/oauth/:provider', (req: Request, res: Response) => {
     const provider = req.params.provider as OAuthProvider;
-    const callbackUrl = `${getBaseUrl(req)}/gateway/auth/${provider}/callback`;
+    const callbackUrl = `${getBaseUrl(req)}/gateway/oauth/${provider}/callback`;
 
     const result = buildAuthorizeUrl(provider, callbackUrl);
     if (!result) {
@@ -51,7 +51,7 @@ export function createGatewayRouter(): Router {
 
   // ─── OAuth2: Callback ───────────────────────────────
 
-  router.get('/auth/:provider/callback', async (req: Request, res: Response) => {
+  router.get('/oauth/:provider/callback', async (req: Request, res: Response) => {
     const { code, state } = req.query;
 
     if (!code || !state || typeof code !== 'string' || typeof state !== 'string') {
@@ -67,7 +67,7 @@ export function createGatewayRouter(): Router {
     }
 
     // Exchange code for user info
-    const callbackUrl = `${getBaseUrl(req)}/gateway/auth/${provider}/callback`;
+    const callbackUrl = `${getBaseUrl(req)}/gateway/oauth/${provider}/callback`;
     const oauthUser = await exchangeCodeForUser(provider, code, callbackUrl);
     if (!oauthUser) {
       res.status(401).send('OAuth authentication failed');
@@ -101,8 +101,8 @@ export function createGatewayRouter(): Router {
     session.displayName = user.displayName || user.username;
     session.avatarUrl = user.avatarUrl;
 
-    // Redirect to main app
-    res.redirect('/');
+    // Redirect to loading page while container starts
+    res.redirect('/gateway/loading');
   });
 
   // ─── Logout ─────────────────────────────────────────
@@ -126,6 +126,10 @@ export function createGatewayRouter(): Router {
   });
 
   // ─── Loading page for container initialization ────────
+  router.get('/loading', (_req: Request, res: Response) => {
+    res.send(buildLoadingPage());
+  });
+
   router.get('/loading/:agentId', (req: Request, res: Response) => {
     const { agentId } = req.params;
     res.send(buildLoadingPage(agentId));
@@ -218,6 +222,13 @@ function buildLoadingPage(agentId?: string): string {
       font-size: 14px;
       color: rgba(255,255,255,0.3);
     }
+    .footer a {
+      color: #8b5cf6;
+      text-decoration: none;
+    }
+    .footer a:hover {
+      text-decoration: underline;
+    }
   </style>
 </head>
 <body>
@@ -234,42 +245,39 @@ function buildLoadingPage(agentId?: string): string {
       </div>
     </div>
 
-    <p class="footer">Powered by AionUi Gateway</p>
+    <p class="footer" id="status">已等待 <span id="elapsed">0</span>s · Powered by AionUi Gateway</p>
   </div>
 
   <script>
-    // 检查连接状态
-    let checkCount = 0;
-    const maxChecks = 30; // 最多检查30次（5分钟）
+    const startTime = Date.now();
 
-    function checkConnection() {
-      checkCount++;
-
-      // 发送 ping 请求检查是否已准备好
-      fetch('/api/status', { method: 'HEAD' })
-        .then(() => {
-          // 如果已经登录，重定向到主页
-          if (document.cookie.includes('sessionId')) {
-            window.location.href = '/';
-          } else if (checkCount < maxChecks) {
-            // 继续等待
-            setTimeout(checkConnection, 10000); // 每10秒检查一次
-          }
-        })
-        .catch(() => {
-          // 如果还没准备好，继续等待
-          if (checkCount < maxChecks) {
-            setTimeout(checkConnection, 10000); // 每10秒检查一次
-          } else {
-            // 超时后提示用户
-            document.querySelector('.subtitle').innerHTML =
-              '启动时间较长，请耐心等待<br>或刷新页面重试';
-          }
-        });
+    function updateElapsed() {
+      const elapsed = Math.floor((Date.now() - startTime) / 1000);
+      const el = document.getElementById('elapsed');
+      if (el) el.textContent = elapsed;
+      requestAnimationFrame(updateElapsed);
     }
+    updateElapsed();
 
-    // 开始检查连接
-    setTimeout(checkConnection, 5000); // 5秒后开始第一次检查
+    // Request main page to trigger container startup (ensureInstance).
+    // The request blocks server-side until the container is ready, then resolves.
+    fetch('/')
+      .then((response) => {
+        if (response.status < 500) {
+          // Container is ready, redirect to app
+          window.location.href = '/';
+        } else {
+          showError();
+        }
+      })
+      .catch(() => {
+        showError();
+      });
+
+    function showError() {
+      document.querySelector('.subtitle').innerHTML =
+        '启动时间较长或遇到问题<br>请<a href="/" style="color: #8b5cf6">点击重试</a>或刷新页面';
+    }
   </script>
 </body>
 </html>`;
@@ -283,14 +291,12 @@ function getBaseUrl(req: Request): string {
 }
 
 function buildLoginPage(providers: string[]): string {
-
-function buildLoginPage(providers: string[]): string {
   const providerButtons = providers
     .map((p) => {
       const label = p.charAt(0).toUpperCase() + p.slice(1);
       const icon = p === 'github' ? '🐙' : p === 'google' ? '🔍' : p === 'zhimi' ? '🏢' : p === 'feishu' ? '📱' : '🔑';
       const displayLabel = p === 'zhimi' ? 'Zhimi SSO' : p === 'feishu' ? 'Feishu SSO' : label;
-      return `<a href="/gateway/auth/${p}" class="btn btn-${p}">${icon} Sign in with ${displayLabel}</a>`;
+      return `<a href="/gateway/oauth/${p}" class="btn btn-${p}">${icon} Sign in with ${displayLabel}</a>`;
     })
     .join('\n        ');
 

@@ -164,7 +164,7 @@ export function getRunningInstances(): UserInstance[] {
 
 export function getAllocatedPorts(): Set<number> {
   const rows = getDb()
-    .prepare("SELECT port FROM instances WHERE status IN ('starting', 'running')")
+    .prepare('SELECT port FROM instances')
     .all() as Array<{ port: number }>;
 
   return new Set(rows.map((r) => r.port));
