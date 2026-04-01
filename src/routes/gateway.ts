@@ -259,20 +259,34 @@ function buildLoadingPage(agentId?: string): string {
     }
     updateElapsed();
 
-    // Request main page to trigger container startup (ensureInstance).
+    // Poll main page to trigger container startup (ensureInstance).
     // The request blocks server-side until the container is ready, then resolves.
-    fetch('/')
-      .then((response) => {
-        if (response.status < 500) {
-          // Container is ready, redirect to app
-          window.location.href = '/';
-        } else {
-          showError();
-        }
-      })
-      .catch(() => {
-        showError();
-      });
+    // Retries automatically on failure (e.g. container OOM restart in progress).
+    const MAX_RETRIES = 5;
+    let attempt = 0;
+
+    function tryConnect() {
+      attempt++;
+      fetch('/')
+        .then((response) => {
+          if (response.status < 500) {
+            // Container is ready, redirect to app
+            window.location.href = '/';
+          } else if (attempt < MAX_RETRIES) {
+            setTimeout(tryConnect, 3000);
+          } else {
+            showError();
+          }
+        })
+        .catch(() => {
+          if (attempt < MAX_RETRIES) {
+            setTimeout(tryConnect, 3000);
+          } else {
+            showError();
+          }
+        });
+    }
+    tryConnect();
 
     function showError() {
       document.querySelector('.subtitle').innerHTML =

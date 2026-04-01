@@ -47,9 +47,16 @@ function initSchema(database: Database.Database): void {
       pid INTEGER NOT NULL,
       status TEXT NOT NULL DEFAULT 'stopped',
       last_active INTEGER NOT NULL,
-      started_at INTEGER NOT NULL
+      started_at INTEGER NOT NULL,
+      restart_count INTEGER NOT NULL DEFAULT 0
     )
   `);
+
+  // Migration: add restart_count column if missing
+  const columns = database.prepare("PRAGMA table_info('instances')").all() as Array<{ name: string }>;
+  if (!columns.some((c) => c.name === 'restart_count')) {
+    database.exec('ALTER TABLE instances ADD COLUMN restart_count INTEGER NOT NULL DEFAULT 0');
+  }
 
   console.log('[db] Schema initialized');
 }
@@ -119,14 +126,15 @@ export function getInstanceByUserId(userId: string): UserInstance | null {
 export function upsertInstance(instance: UserInstance): void {
   getDb()
     .prepare(
-      `INSERT INTO instances (user_id, port, pid, status, last_active, started_at)
-       VALUES (?, ?, ?, ?, ?, ?)
+      `INSERT INTO instances (user_id, port, pid, status, last_active, started_at, restart_count)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(user_id) DO UPDATE SET
          port = excluded.port,
          pid = excluded.pid,
          status = excluded.status,
          last_active = excluded.last_active,
-         started_at = excluded.started_at`,
+         started_at = excluded.started_at,
+         restart_count = excluded.restart_count`,
     )
     .run(
       instance.userId,
@@ -135,6 +143,7 @@ export function upsertInstance(instance: UserInstance): void {
       instance.status,
       instance.lastActive,
       instance.startedAt,
+      instance.restartCount,
     );
 }
 
@@ -148,6 +157,16 @@ export function updateInstanceActivity(userId: string): void {
   getDb()
     .prepare('UPDATE instances SET last_active = ? WHERE user_id = ?')
     .run(Date.now(), userId);
+}
+
+export function incrementRestartCount(userId: string): number {
+  getDb()
+    .prepare('UPDATE instances SET restart_count = restart_count + 1, last_active = ? WHERE user_id = ?')
+    .run(Date.now(), userId);
+  const row = getDb()
+    .prepare('SELECT restart_count FROM instances WHERE user_id = ?')
+    .get(userId) as { restart_count: number } | undefined;
+  return row?.restart_count ?? 0;
 }
 
 export function deleteInstance(userId: string): void {
@@ -194,5 +213,6 @@ function mapInstance(row: Record<string, unknown>): UserInstance {
     status: row.status as UserInstance['status'],
     lastActive: row.last_active as number,
     startedAt: row.started_at as number,
+    restartCount: (row.restart_count as number) || 0,
   };
 }

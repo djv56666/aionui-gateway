@@ -19,4 +19,5 @@ export interface UserInstance {
   status: 'starting' | 'running' | 'stopping' | 'stopped';
   lastActive: number;
   startedAt: number;
+  restartCount: number;
 }

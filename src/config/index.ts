@@ -71,7 +71,10 @@ export const config = {
   containerPort: parseInt(envOrDefault('CONTAINER_PORT', '25808'), 10),
 
   /** Container resource limits */
-  containerMemory: envOrDefault('CONTAINER_MEMORY', '512m'),
+  containerMemory: envOrDefault('CONTAINER_MEMORY', '3g'),
+  containerMemoryMax: envOrDefault('CONTAINER_MEMORY_MAX', '5g'),
+  /** Memory increment step on each OOM restart (e.g. 512m, 1g) */
+  containerMemoryStep: envOrDefault('CONTAINER_MEMORY_STEP', '512m'),
   containerCpus: envOrDefault('CONTAINER_CPUS', '1'),
   containerPidsLimit: parseInt(envOrDefault('CONTAINER_PIDS_LIMIT', '256'), 10),
 

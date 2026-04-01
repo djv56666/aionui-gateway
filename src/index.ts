@@ -72,8 +72,9 @@ server.listen(config.port, config.gatewayHost, () => {
   console.log('\n' + '='.repeat(60));
   console.log('⚡ AionUi Gateway started');
   console.log('='.repeat(60));
-  console.log(`   URL:          http://localhost:${config.port}`);
-  console.log(`   Login page:   http://localhost:${config.port}/gateway/login`);
+  const displayHost = config.gatewayHost === '0.0.0.0' ? 'localhost' : config.gatewayHost;
+  console.log(`   URL:          http://${displayHost}:${config.port}`);
+  console.log(`   Login page:   http://${displayHost}:${config.port}/gateway/login`);
   console.log(`   Providers:    ${getProviderSummary()}`);
   console.log(`   Data root:    ${config.instanceDataRoot}`);
   console.log(`   Port range:   ${config.instancePortStart}-${config.instancePortEnd}`);

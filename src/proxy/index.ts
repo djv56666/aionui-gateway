@@ -9,7 +9,7 @@ import http from 'node:http';
 import type { Request, Response, NextFunction } from 'express';
 import type { IncomingMessage } from 'node:http';
 import type { Socket } from 'node:net';
-import { ensureInstance, touchInstance, getInstanceToken } from '../instance/manager.js';
+import { ensureInstance, touchInstance, getInstanceToken, invalidateRunningCache } from '../instance/manager.js';
 
 interface AuthenticatedSession {
   userId?: string;
@@ -94,6 +94,11 @@ export function createProxyHandler() {
     on: {
       error(err, _req, res) {
         console.error('[proxy] Error:', err.message);
+        // Connection refused — clear running cache so next request triggers restart
+        if (err.message.includes('ECONNREFUSED')) {
+          const session = (_req as any).session as AuthenticatedSession | undefined;
+          if (session?.userId) invalidateRunningCache(session.userId);
+        }
         if (res && 'writeHead' in res && !res.headersSent) {
           (res as Response).status(502).json({
             error: 'Backend instance unavailable',
@@ -278,6 +283,10 @@ export function createWsUpgradeHandler() {
 
       proxyReq.on('error', (err) => {
         console.error('[ws] Proxy request error:', err.message);
+        // Connection refused means container is dead — clear cache so next request triggers restart
+        if (err.message.includes('ECONNREFUSED') && sessionData?.userId) {
+          invalidateRunningCache(sessionData.userId);
+        }
         clientSocket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
         clientSocket.destroy();
       });
