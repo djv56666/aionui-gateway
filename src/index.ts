@@ -68,7 +68,7 @@ server.on('upgrade', createWsUpgradeHandler());
 
 // ─── Start ────────────────────────────────────────────
 
-server.listen(config.port, () => {
+server.listen(config.port, config.gatewayHost, () => {
   console.log('\n' + '='.repeat(60));
   console.log('⚡ AionUi Gateway started');
   console.log('='.repeat(60));
