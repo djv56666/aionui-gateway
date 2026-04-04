@@ -11,8 +11,8 @@
   "dependencies": {
     "express": "^4.18.2",
     "jsonwebtoken": "^9.0.2",
-    "ws": "^8.14.2",
-    "node-cron": "^3.0.3"
+    "node-cron": "^3.0.3",
+    "ws": "^8.20.0"
   },
   "devDependencies": {
     "@types/node": "^20.10.0",
@@ -25,9 +25,12 @@
   "keywords": [
     "aionui",
     "agent",
-    "opencode",
+    "runtime",
     "sidecar",
-    "acp-bridge"
+    "acp-bridge",
+    "opencode",
+    "claude",
+    "codex"
   ],
   "author": "AionUI Team",
   "license": "MIT"

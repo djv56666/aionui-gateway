@@ -24,6 +24,6 @@ log "ACP Port: $ACP_PORT"
 cd "$WORK_DIR"
 
 # Start Sidecar (foreground, as PID 1)
-# Sidecar will internally start opencode acp and ACP Bridge
+# Sidecar will internally start runtime process and ACP Bridge
 log "Starting Agent Sidecar..."
 exec node /opt/sidecar/index.js
