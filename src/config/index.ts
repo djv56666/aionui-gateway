@@ -87,6 +87,18 @@ export const config = {
   /** Gateway server port */
   gatewayPort: parseInt(envOrDefault('GATEWAY_PORT', '3000'), 10),
 
+  /** Root data directory for all user data (global-config, agents, sessions) */
+  dataRoot: path.resolve(projectRoot, envOrDefault('DATA_ROOT', './data')),
+
+  /** Runtime type → Docker image mapping */
+  runtimeImages: {
+    opencode: envOrDefault('RUNTIME_IMAGE_OPENCODE', 'aionui-runtime-opencode:latest'),
+    claude:   envOrDefault('RUNTIME_IMAGE_CLAUDE',   'aionui-runtime-claude:latest'),
+    codex:    envOrDefault('RUNTIME_IMAGE_CODEX',     'aionui-runtime-codex:latest'),
+    goose:    envOrDefault('RUNTIME_IMAGE_GOOSE',     'aionui-runtime-goose:latest'),
+    openclaw: envOrDefault('RUNTIME_IMAGE_OPENCLAW',  'aionui-runtime-openclaw:latest'),
+  } as Record<string, string>,
+
   /** Project root */
   projectRoot,
 } as const;

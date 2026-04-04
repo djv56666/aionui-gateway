@@ -64,13 +64,13 @@ Sidecar 不在数据面上，只做 spawn + 健康检查 + 心跳上报
 
 ## 支持的 Runtime
 
-| Runtime | Transport | CLI | 参数 | 对外端口 |
-|---------|-----------|-----|------|---------|
-| **opencode** | stdio | `opencode` | `acp` | 3001 |
-| **claude** | stdio | `claude` | `acp` | 3001 |
-| **codex** | stdio | `npx` | `@anthropic-ai/codex-acp` | 3001 |
-| **goose** | stdio | `goose` | `acp` | 3001 |
-| **openclaw** | gateway | `openclaw` | `gateway --port 18789` | 18789 |
+| Runtime | Transport | CLI | 参数 | 对外端口 | 镜像名 |
+|---------|-----------|-----|------|---------|--------|
+| **opencode** | stdio | `opencode` | `acp` | 3001 | `aionui-runtime-opencode` |
+| **claude** | stdio | `claude` | `acp` | 3001 | `aionui-runtime-claude` |
+| **codex** | stdio | `npx` | `@anthropic-ai/codex-acp` | 3001 | `aionui-runtime-codex` |
+| **goose** | stdio | `goose` | `acp` | 3001 | `aionui-runtime-goose` |
+| **openclaw** | gateway | `openclaw` | `gateway --port 18789` | 18789 | `aionui-runtime-openclaw` |
 
 ## 环境变量
 
@@ -109,9 +109,28 @@ Runtime 容器按需启动，配置文件由 Gateway 生成并通过 Docker volu
 5. **ACP Bridge 仅 stdio 使用** — gateway 模式不经过 ACP Bridge
 6. **ACP 协议参考** — 涉及 ACP 协议细节（方法、参数、消息格式、流式通知等）时，查阅 `../AionUI/` 项目中的实现（`src/common/types/acpTypes.ts`、`src/process/agent/acp/`），不凭记忆猜测
 
+## 镜像命名规范
+
+所有 Agent Runtime 镜像统一命名格式：
+
+```
+aionui-runtime-{type}:latest
+```
+
+| Runtime | 镜像名 | 构建命令 |
+|---------|--------|----------|
+| opencode | `aionui-runtime-opencode:latest` | `docker build -t aionui-runtime-opencode:latest -f images/opencode/Dockerfile .` |
+| claude | `aionui-runtime-claude:latest` | `docker build -t aionui-runtime-claude:latest -f images/claude/Dockerfile .` |
+| codex | `aionui-runtime-codex:latest` | `docker build -t aionui-runtime-codex:latest -f images/codex/Dockerfile .` |
+| goose | `aionui-runtime-goose:latest` | `docker build -t aionui-runtime-goose:latest -f images/goose/Dockerfile .` |
+| openclaw | `aionui-runtime-openclaw:latest` | `docker build -t aionui-runtime-openclaw:latest -f images/openclaw/Dockerfile .` |
+
+> **注意**：`aionui:latest` 是 AionUI 主应用镜像（由 `instance/manager.ts` 管理），与 Runtime 镜像是两套不同的东西，不要混淆。
+
 ## 镜像构建
 
 所有 Dockerfile 统一包含：
 - **中国镜像源** — npm: `registry.npmmirror.com`，apt: `mirrors.aliyun.com`
 - **CRLF 修复** — `sed -i 's/\r$//' /entrypoint.sh`（Windows 开发环境产生的 CRLF 换行符）
 - **健康检查** — Sidecar 内置 HTTP `:3000/health`（由 agent-sidecar.js 提供）
+- **构建上下文** — 在 `agent-runtime/` 目录下执行构建（注意结尾的 `.`），不在 `images/` 子目录内构建

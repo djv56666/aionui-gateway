@@ -13,9 +13,22 @@
 import { Router, type Request, type Response } from 'express';
 import jwt from 'jsonwebtoken';
 const { sign } = jwt;
+import { exec } from 'node:child_process';
+import { promisify } from 'node:util';
+import path from 'node:path';
 import { config } from '../config/index.js';
-import path from 'path';
 import { getBaseUrl } from '../utils/index.js';
+import {
+  ensureUserDirs,
+  ensureSessionDir,
+  copyGlobalConfig,
+  agentDir as resolveAgentDir,
+  sessionDir as resolveSessionDir,
+} from '../services/runtime-fs.js';
+import { getMountProfile, buildDockerMounts, buildDockerEnv } from '../services/runtime-mounts.js';
+import { injectConfig, type RuntimeConfigOptions } from '../services/runtime-config.js';
+
+const execAsync = promisify(exec);
 
 // ── Types ──────────────────────────────────────────────────
 
@@ -31,222 +44,235 @@ interface ConnectErrorResponse {
   details?: string;
 }
 
-// ── Agent Container Registry ───────────────────────────────
-// Phase 1: static mapping via environment variables
-// Phase 2: use Docker API for dynamic container management
-
 interface AgentContainer {
   agentId: string;
+  runtimeType: string;
+  sessionId: string;
   containerName: string;
   port: number;
   status: 'stopped' | 'starting' | 'running' | 'error';
 }
 
-/**
- * Get agent container info from environment.
- * AGENT_CONTAINERS=agent-id-1:container-name:port,agent-id-2:container-name:port
- */
-function getAgentContainer(agentId: string): AgentContainer | null {
-  const containersEnv = process.env.AGENT_CONTAINERS || '';
-  const entries = containersEnv.split(',').filter(Boolean);
+// ── Session ID Generator ──────────────────────────────────
 
-  for (const entry of entries) {
-    const [id, name, portStr] = entry.split(':');
-    if (id === agentId) {
-      const port = parseInt(portStr, 10);
-      if (!isNaN(port)) {
-        return {
-          agentId,
-          containerName: name,
-          port,
-          status: 'running', // Assume running in static config
-        };
-      }
-    }
-  }
-
-  return null;
+function generateSessionId(): string {
+  const ts = Date.now().toString(36);
+  const rand = Math.random().toString(36).substring(2, 8);
+  return `${ts}-${rand}`;
 }
 
+// ── Container Registry ────────────────────────────────────
+// Phase 2 will use Docker API; for now we track active sessions in-memory.
+
+const activeContainers = new Map<string, AgentContainer>();
+
+function containerNameFor(agentId: string, runtimeType: string): string {
+  return `aionui-agent-${agentId.substring(0, 12)}-${runtimeType}`;
+}
+
+// ── Container Lifecycle ───────────────────────────────────
+
 /**
- * Ensure the agent container is running.
- * Phase 1: Use Docker CLI for cold start
+ * Ensure the agent container is running for the given user + agent + runtime.
+ *
+ * Flow:
+ *  1. Resolve / create host directory structure (user dirs, session dir)
+ *  2. Copy global-config → session dir
+ *  3. Inject dynamic config (API keys, MCP, permissions)
+ *  4. Build Docker mount flags from the runtime's MountProfile
+ *  5. docker run (or docker start if container exists but stopped)
+ *  6. Wait for health check to pass
  */
-async function ensureAgentRunning(agentId: string, checkOnly: boolean = false): Promise<{ container: AgentContainer; needsLoading: boolean }> {
-  const container = getAgentContainer(agentId);
-  if (!container) {
-    throw new Error(`Agent container not found: ${agentId}`);
+async function ensureAgentRunning(
+  userId: string,
+  agentId: string,
+  runtimeType: string,
+  configOptions?: RuntimeConfigOptions,
+): Promise<{ container: AgentContainer; needsLoading: boolean }> {
+  const cname = containerNameFor(agentId, runtimeType);
+  const existing = activeContainers.get(cname);
+
+  // Fast path: already tracked as running
+  if (existing && existing.status === 'running') {
+    const isRunning = await isContainerRunning(cname);
+    if (isRunning) {
+      return { container: existing, needsLoading: false };
+    }
+    // Stale — fall through to recreation
+    activeContainers.delete(cname);
   }
 
-  const { exec } = require('child_process');
-  const { promisify } = require('util');
-  const execAsync = promisify(exec);
-
-  // Check if container exists and is running
+  // Check if container exists on Docker but stopped
   try {
-    const { stdout: inspectOutput } = await execAsync(`docker inspect ${container.containerName}`);
-    const containerInfo = JSON.parse(inspectOutput);
-
-    if (containerInfo[0]?.State?.Running) {
-      // Container is running, check if ACP Bridge is ready
-      const isHealthy = await checkAcpBridgeHealth(container.containerName, container.port);
-      if (isHealthy) {
-        return {
-          container: {
-            ...container,
-            status: 'running'
-          },
-          needsLoading: false
-        };
-      } else {
-        // Container is running but ACP Bridge is not ready
-        return {
-          container: {
-            ...container,
-            status: 'running'
-          },
-          needsLoading: true
-        };
-      }
-    } else if (containerInfo[0]?.State?.Status === 'exited') {
-      // Container exists but stopped, start it
-      console.log(`[agent-connect] Starting container ${container.containerName}`);
-      await execAsync(`docker start ${container.containerName}`);
-
-      // Wait for container to be ready
-      await waitForContainerReady(container.containerName, execAsync);
-
-      return {
-        container: {
-          ...container,
-          status: 'running'
-        },
-        needsLoading: true // ACP Bridge might not be ready yet
+    const { stdout } = await execAsync(`docker inspect ${cname}`);
+    const info = JSON.parse(stdout);
+    if (info[0]?.State?.Running) {
+      const container: AgentContainer = {
+        agentId,
+        runtimeType,
+        sessionId: existing?.sessionId ?? generateSessionId(),
+        containerName: cname,
+        port: existing?.port ?? await allocatePort(),
+        status: 'running',
       };
+      activeContainers.set(cname, container);
+      return { container, needsLoading: false };
     }
-  } catch (err) {
-    if ((err as any).code === '404') {
-      // Container doesn't exist, create it
-      console.log(`[agent-connect] Creating container ${container.containerName} for agent ${agentId}`);
-      await createAgentContainer(agentId, container, execAsync);
-
-      // Wait for container to be ready
-      await waitForContainerReady(container.containerName, execAsync);
-
-      return {
-        container: {
-          ...container,
-          status: 'running'
-        },
-        needsLoading: true // ACP Bridge might not be ready yet
+    if (info[0]?.State?.Status === 'exited') {
+      // Reuse the container — just start it
+      const container: AgentContainer = {
+        agentId,
+        runtimeType,
+        sessionId: existing?.sessionId ?? generateSessionId(),
+        containerName: cname,
+        port: existing?.port ?? await allocatePort(),
+        status: 'starting',
       };
+      console.log(`[agent-connect] Starting existing container ${cname}`);
+      await execAsync(`docker start ${cname}`);
+      activeContainers.set(cname, { ...container, status: 'running' });
+      return { container, needsLoading: true };
     }
-    throw err;
+  } catch {
+    // Container doesn't exist — will create below
   }
 
-  // If we get here, something is wrong
-  throw new Error(`Failed to determine container status for agent ${agentId}`);
+  // ── Full creation path ──
+
+  // 1. Ensure host directory structure
+  ensureUserDirs(userId);
+  const sessionId = generateSessionId();
+  ensureSessionDir(userId, sessionId);
+
+  // 2. Copy global config → session
+  copyGlobalConfig(userId, runtimeType, sessionId);
+
+  // 3. Inject dynamic config
+  injectConfig(resolveSessionDir(userId, sessionId), runtimeType, configOptions ?? {});
+
+  // 4. Create the container
+  const port = await allocatePort();
+  const container: AgentContainer = {
+    agentId,
+    runtimeType,
+    sessionId,
+    containerName: cname,
+    port,
+    status: 'starting',
+  };
+
+  await createAgentContainer(userId, container);
+
+  // 5. Wait for readiness
+  await waitForContainerReady(cname);
+
+  activeContainers.set(cname, { ...container, status: 'running' });
+  return { container: { ...container, status: 'running' }, needsLoading: true };
 }
 
 /**
- * Create a new agent container.
+ * Create a new agent container with config injection.
  */
-async function createAgentContainer(agentId: string, container: AgentContainer, execAsync: Function): Promise<void> {
-  const { config } = await import('../config/index.js');
-  const userDataDir = path.resolve(config.instanceDataRoot, agentId);
+async function createAgentContainer(userId: string, container: AgentContainer): Promise<void> {
+  const { runtimeType, sessionId, containerName, port } = container;
 
-  // Ensure user data directory exists
-  const { mkdir } = require('fs').promises;
-  await mkdir(userDataDir, { recursive: true });
+  // Resolve host paths
+  const sDir = resolveSessionDir(userId, sessionId);
+  const aDir = resolveAgentDir(userId, container.agentId);
 
-  // Build Docker run command
-  const dockerCmd = config.dockerCmd;
-  const dockerImage = config.dockerImage;
-  const containerPort = config.containerPort;
-  const memory = config.containerMemory;
-  const cpus = config.containerCpus;
-  const pids = config.containerPidsLimit;
+  // Get mount profile and build flags
+  const profile = getMountProfile(runtimeType);
+  const mountFlags = buildDockerMounts(sDir, aDir, profile);
+  const envFlags = buildDockerEnv(container.agentId, profile);
+
+  // Resolve Docker image
+  const image = config.runtimeImages[runtimeType] ?? config.dockerImage;
+
+  // Gateway URL that the sidecar can reach
+  const gatewayUrl = process.env.GATEWAY_BASE_URL || `http://${config.gatewayHost}:${config.gatewayPort}`;
 
   const runCommand = [
-    dockerCmd,
-    'run',
-    '-d',
-    '--name', container.containerName,
+    config.dockerCmd,
+    'run', '-d',
+    '--name', containerName,
     '--restart', 'unless-stopped',
-    '--memory', memory,
-    '--cpus', cpus,
-    '--pids-limit', pids.toString(),
-    '-p', `${container.port}:${containerPort}`,
-    '-v', `${userDataDir}:/workspace`,
-    '-v', `${path.resolve(__dirname, '../agent-runtime')}:/app/agent-runtime`,
-    '-e', `AGENT_ID=${agentId}`,
-    '-e', `ACP_PORT=${containerPort}`,
-    '-e', `WORK_DIR=/workspace`,
-    dockerImage
+    '--memory', config.containerMemory,
+    '--memory-reservation', config.containerMemory,
+    '--memory-swap', config.containerMemoryMax,
+    '--cpus', config.containerCpus,
+    '--pids-limit', String(config.containerPidsLimit),
+    '-p', `${port}:${config.containerPort}`,
+    ...mountFlags,
+    ...envFlags,
+    '-e', `ACP_PORT=${config.containerPort}`,
+    '-e', `GATEWAY_URL=${gatewayUrl}`,
+    '-e', `GATEWAY_SECRET=${config.gatewaySecret}`,
+    '-e', `TRANSPORT_MODE=${profile.transportMode}`,
+    image,
   ].join(' ');
 
-  console.log(`[agent-connect] Running: ${runCommand}`);
+  console.log(`[agent-connect] Creating container: ${runCommand}`);
   await execAsync(runCommand);
 }
 
 /**
- * Wait for container to be ready.
+ * Check if a Docker container is running.
  */
-async function waitForContainerReady(containerName: string, execAsync: Function): Promise<void> {
-  let attempts = 0;
-  const maxAttempts = 30; // 30 seconds max
-
-  while (attempts < maxAttempts) {
-    try {
-      // Check if container is running
-      const { stdout: inspectOutput } = await execAsync(`docker inspect ${containerName}`);
-      const containerInfo = JSON.parse(inspectOutput);
-
-      if (containerInfo[0]?.State?.Running) {
-        // Wait a bit more for services to start
-        await new Promise(resolve => setTimeout(resolve, 3000));
-        return;
-      }
-    } catch (err) {
-      // Container might not be ready yet
-    }
-
-    attempts++;
-    await new Promise(resolve => setTimeout(resolve, 1000));
+async function isContainerRunning(name: string): Promise<boolean> {
+  try {
+    const { stdout } = await execAsync(`docker inspect --format '{{.State.Running}}' ${name}`);
+    return stdout.trim() === 'true';
+  } catch {
+    return false;
   }
-
-  throw new Error(`Container ${containerName} failed to start within ${maxAttempts} seconds`);
 }
 
 /**
- * Check if ACP Bridge is healthy.
+ * Allocate an available port from the configured range.
  */
-async function checkAcpBridgeHealth(containerName: string, port: number): Promise<boolean> {
+async function allocatePort(): Promise<number> {
+  // Get ports currently in use by running containers
+  const { stdout } = await execAsync(
+    `docker ps --filter name=aionui-agent- --format '{{.Ports}}'`
+  );
+  const usedPorts = new Set<number>();
+  for (const line of stdout.split('\n')) {
+    const match = line.match(/:(\d+)->/);
+    if (match) usedPorts.add(parseInt(match[1], 10));
+  }
+
+  for (let p = config.instancePortStart; p <= config.instancePortEnd; p++) {
+    if (!usedPorts.has(p)) return p;
+  }
+  throw new Error('No available ports in the configured range');
+}
+
+/**
+ * Wait for container to be running and HTTP health check to pass.
+ */
+async function waitForContainerReady(containerName: string, maxWaitMs = 60_000): Promise<void> {
+  const start = Date.now();
+  while (Date.now() - start < maxWaitMs) {
+    const running = await isContainerRunning(containerName);
+    if (running) {
+      // Give the sidecar a moment to initialise
+      await new Promise(r => setTimeout(r, 2000));
+      return;
+    }
+    await new Promise(r => setTimeout(r, 1000));
+  }
+  throw new Error(`Container ${containerName} failed to start within ${maxWaitMs / 1000}s`);
+}
+
+/**
+ * Check if the sidecar health endpoint is responsive.
+ */
+async function checkSidecarHealth(containerName: string, port: number): Promise<boolean> {
   try {
-    const { exec } = require('child_process');
-    const { promisify } = require('util');
-    const execAsync = promisify(exec);
-
-    // Check if the container is running first
-    const { stdout: inspectOutput } = await execAsync(`docker inspect ${containerName}`);
-    const containerInfo = JSON.parse(inspectOutput);
-    if (!containerInfo[0]?.State?.Running) {
-      return false;
-    }
-
-    // Check if ACP bridge process is running inside container
-    const { stdout: psOutput } = await execAsync(`docker exec ${containerName} ps aux`);
-    if (!psOutput.includes('acp-bridge')) {
-      return false;
-    }
-
-    // Check if the port is accessible (try curl to health endpoint)
-    try {
-      await execAsync(`docker exec ${containerName} curl -s http://localhost:${port}/ --connect-timeout 5`);
-      return true;
-    } catch {
-      return false;
-    }
+    const res = await fetch(`http://127.0.0.1:${port}/health`, {
+      signal: AbortSignal.timeout(3000),
+    });
+    return res.ok;
   } catch {
     return false;
   }
@@ -269,7 +295,6 @@ export function createAgentConnectRouter(): Router {
    * GET /api/agent/:agentId/connect/loading
    *
    * Returns a loading page while the container is being initialized.
-   * This is useful for showing a loading state during cold start.
    */
   router.get('/:agentId/connect/loading', (req: Request, res: Response) => {
     const { agentId } = req.params;
@@ -280,11 +305,15 @@ export function createAgentConnectRouter(): Router {
   /**
    * GET /api/agent/:agentId/connect
    *
+   * Query params:
+   *   runtimeType  (optional) — which runtime to use, default 'opencode'
+   *
    * Returns connection info for direct ACP WebSocket connection.
    * Gateway signs a short-lived JWT that the ACP Bridge validates.
    */
   router.get('/:agentId/connect', async (req: Request, res: Response) => {
     const agentId = req.params.agentId as string;
+    const runtimeType = (req.query.runtimeType as string) || 'opencode';
     const session = req.session as { userId?: string } | undefined;
     const userId = session?.userId;
 
@@ -300,24 +329,21 @@ export function createAgentConnectRouter(): Router {
         return;
       }
 
-      // 2. Ensure container is running (cold start)
-      const { container: container, needsLoading } = await ensureAgentRunning(agentId);
+      // 2. Ensure container is running (cold start with config injection)
+      const { container, needsLoading } = await ensureAgentRunning(userId, agentId, runtimeType);
 
-      // 3. If ACP Bridge is not ready, return loading URL
+      // 3. If not ready yet, return loading state
       if (needsLoading) {
-        const baseUrl = getBaseUrl(req);
-        return res.json({
-          url: `${baseUrl}/gateway/loading/${agentId}`,
-          token: '',
-          protocol: 'loading',
-          message: 'Container is starting up, please wait...'
-        });
-      }
-
-      // 4. Wait for ACP Bridge to be ready (double check)
-      const isHealthy = await checkAcpBridgeHealth(container.containerName, container.port);
-      if (!isHealthy) {
-        throw new Error('ACP Bridge is not ready');
+        const healthy = await checkSidecarHealth(container.containerName, container.port);
+        if (!healthy) {
+          const baseUrl = getBaseUrl(req);
+          return res.json({
+            url: `${baseUrl}/gateway/loading/${agentId}`,
+            token: '',
+            protocol: 'loading' as const,
+            message: 'Container is starting up, please wait...',
+          });
+        }
       }
 
       // 4. Sign short-lived JWT for ACP Bridge authentication (5 min)
@@ -325,16 +351,16 @@ export function createAgentConnectRouter(): Router {
         {
           agentId,
           userId,
-          sessionId: `session-${Date.now()}`,
+          sessionId: container.sessionId,
+          runtimeType,
           iat: Math.floor(Date.now() / 1000),
         },
         config.gatewaySecret,
         { expiresIn: '5m' },
       );
 
-      // 5. Return connection through gateway proxy (not direct to container)
+      // 5. Return connection info
       const response: ConnectResponse = {
-        // WebSocket URL goes through gateway to handle routing
         url: `ws://${config.gatewayHost}:${config.port}/api/agent/${agentId}/acp`,
         token: agentToken,
         protocol: 'acp',
@@ -343,7 +369,7 @@ export function createAgentConnectRouter(): Router {
       res.json(response);
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Unknown error';
-      console.error(`[agent-connect] Failed for agent=${agentId}:`, message);
+      console.error(`[agent-connect] Failed for agent=${agentId} runtime=${runtimeType}:`, message);
       res.status(502).json({
         error: 'Failed to connect to agent',
         details: message,
