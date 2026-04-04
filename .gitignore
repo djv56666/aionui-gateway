@@ -4,6 +4,9 @@ data/
 .env
 *.db
 
+# Claude Code local settings
+.claude/
+
 
 aionui.tar
 .aionrs/
