@@ -4,8 +4,8 @@ data/
 .env
 *.db
 
-# Claude Code local settings
-.claude/
+# Claude Code local settings (skills/commands 等项目配置需要提交)
+.claude/settings.local.json
 
 
 aionui.tar
