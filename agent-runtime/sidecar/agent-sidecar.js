@@ -16,6 +16,9 @@
 import { AcpBridge } from './acp-bridge.js';
 import { spawn } from 'child_process';
 import http from 'http';
+import os from 'os';
+
+const PROTOCOL_VERSION = 1;
 
 export class AgentSidecar {
   constructor(config) {
@@ -36,6 +39,11 @@ export class AgentSidecar {
     this.isRunning = false;
     this.heartbeatTimer = null;
     this.healthServer = null;
+
+    // metrics
+    this.requestCount = 0;
+    this.prevCpuUsage = process.cpuUsage();
+    this.prevCpuTime = process.hrtime.bigint();
   }
 
   async start() {
@@ -46,6 +54,9 @@ export class AgentSidecar {
     } else {
       await this.startStdioMode();
     }
+
+    // Register with Gateway (best-effort, non-blocking on failure)
+    await this.register();
 
     // Start heartbeat to gateway
     this.startHeartbeat();
@@ -61,6 +72,9 @@ export class AgentSidecar {
     console.log('[sidecar] Stopping Agent Sidecar...');
     this.isShuttingDown = true;
     this.isRunning = false;
+
+    // Deregister from Gateway (best-effort)
+    await this.deregister();
 
     // Stop heartbeat
     if (this.heartbeatTimer) {
@@ -190,6 +204,138 @@ export class AgentSidecar {
     }
   }
 
+  // ─── registration & discovery ────────────────────────────
+
+  async register() {
+    const payload = {
+      protocolVersion: PROTOCOL_VERSION,
+      agentId: this.config.agentId,
+      transport: this.transport,
+      version: this.config.version || '1.0.0',
+      capabilities: {
+        healthEndpoint: true,
+        infoEndpoint: true,
+        heartbeat: true,
+        configReload: true,
+      },
+      endpoints: {
+        health: '/health',
+        info: '/info',
+        configReload: '/config-reload',
+      },
+      runtime: {
+        cli: this.config.runtimeCli || process.env.RUNTIME_CLI || 'opencode',
+        args: this.config.runtimeArgs || process.env.RUNTIME_ARGS || 'acp',
+      },
+      timestamp: Date.now(),
+    };
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (this.isShuttingDown) return false;
+      try {
+        if (attempt > 0) {
+          await new Promise(r => setTimeout(r, 2000 * Math.pow(2, attempt - 1)));
+        }
+        const response = await fetch(`${this.config.gatewayUrl}/api/internal/register`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${this.config.gatewaySecret}`,
+          },
+          body: JSON.stringify(payload),
+        });
+        if (response.ok) {
+          console.log('[sidecar] Registered with Gateway');
+          return true;
+        }
+        console.warn(`[sidecar] Registration failed (HTTP ${response.status}), attempt ${attempt + 1}/3`);
+      } catch (err) {
+        console.warn(`[sidecar] Registration error (attempt ${attempt + 1}/3):`, err.message);
+      }
+    }
+    console.warn('[sidecar] Registration failed after 3 attempts, continuing without registration');
+    return false;
+  }
+
+  async deregister() {
+    const payload = {
+      agentId: this.config.agentId,
+      reason: 'shutdown',
+      timestamp: Date.now(),
+    };
+
+    try {
+      const response = await fetch(`${this.config.gatewayUrl}/api/internal/deregister`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${this.config.gatewaySecret}`,
+        },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(5000),
+      });
+      if (response.ok) {
+        console.log('[sidecar] Deregistered from Gateway');
+      } else {
+        console.warn(`[sidecar] Deregistration failed: HTTP ${response.status}`);
+      }
+    } catch (err) {
+      console.warn('[sidecar] Deregistration error (best-effort):', err.message);
+    }
+  }
+
+  getInfo() {
+    return {
+      protocolVersion: PROTOCOL_VERSION,
+      agentId: this.config.agentId,
+      version: this.config.version || '1.0.0',
+      transport: this.transport,
+      uptime: process.uptime(),
+      runtime: {
+        cli: this.config.runtimeCli || process.env.RUNTIME_CLI || 'opencode',
+        args: this.config.runtimeArgs || process.env.RUNTIME_ARGS || 'acp',
+      },
+      capabilities: {
+        healthEndpoint: true,
+        infoEndpoint: true,
+        heartbeat: true,
+        configReload: true,
+      },
+      status: this.isRunning ? 'running' : (this.isShuttingDown ? 'shutting_down' : 'stopped'),
+    };
+  }
+
+  // ─── config reload ───────────────────────────────────────
+
+  async reloadRuntime() {
+    console.log('[sidecar] Reloading runtime (config-reload triggered)...');
+
+    // Reset crash restart counter — this is an intentional reload, not a crash
+    this.restartCount = 0;
+    this.restartVersion++;
+
+    try {
+      if (this.transport === 'gateway') {
+        await this.stopGatewayMode();
+        await this.startGatewayMode();
+      } else {
+        await this.stopStdioMode();
+        this.acpBridge = new AcpBridge({
+          acpPort: this.config.acpPort,
+          workDir: this.config.workDir,
+          jwtSecret: this.config.jwtSecret,
+        });
+        await this.acpBridge.start();
+      }
+
+      console.log('[sidecar] Runtime reloaded successfully');
+      return { ok: true, message: 'Runtime reloaded' };
+    } catch (err) {
+      console.error('[sidecar] Runtime reload failed:', err);
+      return { ok: false, error: err.message };
+    }
+  }
+
   // ─── health & heartbeat ─────────────────────────────────
 
   startHeartbeat() {
@@ -256,11 +402,31 @@ export class AgentSidecar {
   }
 
   async collectMetrics() {
+    // CPU usage (percentage of one core, since last sample)
+    const cpuNow = process.cpuUsage(this.prevCpuUsage);
+    const timeNow = process.hrtime.bigint();
+    const elapsedUs = Number(timeNow - this.prevCpuTime) / 1000; // ns → μs
+    const cpuPercent = elapsedUs > 0
+      ? Math.round(((cpuNow.user + cpuNow.system) / elapsedUs) * 100 * 100) / 100
+      : 0;
+    this.prevCpuUsage = process.cpuUsage();
+    this.prevCpuTime = timeNow;
+
+    // Memory usage (bytes)
+    const mem = process.memoryUsage();
+
     return {
-      cpu: 0,
-      memory: 0,
-      requests: 0,
+      cpu: cpuPercent,
+      memory: mem.rss,
+      memoryDetail: {
+        rss: mem.rss,
+        heapTotal: mem.heapTotal,
+        heapUsed: mem.heapUsed,
+        external: mem.external,
+      },
+      requests: this.requestCount,
       uptime: process.uptime(),
+      loadAvg: os.loadavg(),
     };
   }
 
@@ -269,18 +435,36 @@ export class AgentSidecar {
   startHealthServer() {
     const port = parseInt(process.env.HEALTH_PORT || '3000');
     this.healthServer = http.createServer(async (req, res) => {
+      this.requestCount++;
       if (req.url === '/health') {
         const status = await this.checkHealth();
         const code = status === 'healthy' ? 200 : 503;
         res.writeHead(code, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ status, agentId: this.config.agentId, uptime: process.uptime() }));
+      } else if (req.url === '/info') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(this.getInfo()));
+      } else if (req.method === 'POST' && req.url === '/config-reload') {
+        // Bearer token authentication
+        const auth = req.headers.authorization || '';
+        const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+        if (!this.config.gatewaySecret || token !== this.config.gatewaySecret) {
+          res.writeHead(401, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'Unauthorized' }));
+          return;
+        }
+
+        const result = await this.reloadRuntime();
+        const code = result.ok ? 200 : 500;
+        res.writeHead(code, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(result));
       } else {
         res.writeHead(404);
         res.end('Not Found');
       }
     });
     this.healthServer.listen(port, () => {
-      console.log(`[sidecar] Health check listening on :${port}/health`);
+      console.log(`[sidecar] Health/info server listening on :${port}`);
     });
   }
 }

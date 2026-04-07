@@ -9,11 +9,46 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
+// ── Deep merge utility ───────────────────────────────────
+
+function isPlainObject(val: unknown): val is Record<string, unknown> {
+  return typeof val === 'object' && val !== null && !Array.isArray(val);
+}
+
+/**
+ * Recursively merge `source` into `target`.
+ * - Both plain objects → recurse
+ * - Arrays / primitives → source wins
+ * - Returns a new object (inputs are not mutated)
+ */
+export function deepMerge(
+  target: Record<string, unknown>,
+  source: Record<string, unknown>,
+): Record<string, unknown> {
+  const result: Record<string, unknown> = { ...target };
+  for (const key of Object.keys(source)) {
+    if (isPlainObject(result[key]) && isPlainObject(source[key])) {
+      result[key] = deepMerge(
+        result[key] as Record<string, unknown>,
+        source[key] as Record<string, unknown>,
+      );
+    } else {
+      result[key] = source[key];
+    }
+  }
+  return result;
+}
+
+// ── Type definitions ─────────────────────────────────────
+
 export interface RuntimeConfigOptions {
   apiKey?: string;
   model?: string;
   mcpServers?: Record<string, McpServerConfig>;
   permissions?: Record<string, string>;
+
+  /** OpenCode-specific configuration fields */
+  opencode?: OpenCodeConfigOptions;
 }
 
 export interface McpServerConfig {
@@ -22,6 +57,42 @@ export interface McpServerConfig {
   type?: string;
   url?: string;
   enabled?: boolean;
+}
+
+export interface OpenCodeConfigOptions {
+  smallModel?: string;
+  defaultAgent?: string;
+  instructions?: string[];
+  agent?: Record<string, OpenCodeAgentDefinition>;
+  provider?: Record<string, OpenCodeProviderConfig>;
+  plugin?: Record<string, unknown>;
+  disabledProviders?: string[];
+  compaction?: Record<string, unknown>;
+  snapshot?: boolean;
+  formatter?: Record<string, unknown>;
+  autoupdate?: boolean | 'notify';
+  share?: 'manual' | 'auto' | 'disabled';
+  tools?: Record<string, boolean>;
+  watcher?: Record<string, unknown>;
+}
+
+export interface OpenCodeAgentDefinition {
+  description?: string;
+  instructions?: string;
+  model?: string;
+  tools?: string[];
+  mcp?: Record<string, McpServerConfig>;
+  permission?: Record<string, string>;
+}
+
+export interface OpenCodeProviderConfig {
+  options?: {
+    apiKey?: string;
+    timeout?: number;
+    cache?: boolean;
+    [key: string]: unknown;
+  };
+  [key: string]: unknown;
 }
 
 /**
@@ -55,18 +126,35 @@ const INJECTORS: Record<string, InjectorFn> = {
   goose: injectGoose,
 };
 
+/** Safe defaults for ephemeral container environments */
+const OPENCODE_CONTAINER_DEFAULTS: Record<string, unknown> = {
+  autoupdate: false,
+  share: 'disabled',
+  snapshot: false,
+};
+
 function injectOpenCode(configDir: string, options: RuntimeConfigOptions): void {
   const dir = path.join(configDir, 'opencode');
   fs.mkdirSync(dir, { recursive: true });
 
   const config: Record<string, unknown> = {};
+  const oc = options.opencode;
+
+  // ── Shared fields ──
 
   if (options.model) config.model = options.model;
 
+  // Provider: build from apiKey + opencode-specific provider config
+  const providerFromKey: Record<string, unknown> = {};
   if (options.apiKey) {
-    config.provider = {
-      anthropic: { options: { apiKey: options.apiKey } },
-    };
+    providerFromKey.anthropic = { options: { apiKey: options.apiKey } };
+  }
+  const providerFromOc = oc?.provider ?? {};
+  if (Object.keys(providerFromKey).length > 0 || Object.keys(providerFromOc).length > 0) {
+    config.provider = deepMerge(
+      providerFromKey,
+      providerFromOc as Record<string, unknown>,
+    );
   }
 
   if (options.mcpServers && Object.keys(options.mcpServers).length > 0) {
@@ -77,16 +165,37 @@ function injectOpenCode(configDir: string, options: RuntimeConfigOptions): void 
     config.permission = options.permissions;
   }
 
-  // Write if we have any config to inject, or create an empty template
-  const filePath = path.join(dir, 'opencode.json');
-  if (fs.existsSync(filePath)) {
-    // Merge with existing
-    const existing = JSON.parse(fs.readFileSync(filePath, 'utf8'));
-    Object.assign(existing, config);
-    fs.writeFileSync(filePath, JSON.stringify(existing, null, 2));
-  } else if (Object.keys(config).length > 0) {
-    fs.writeFileSync(filePath, JSON.stringify(config, null, 2));
+  // ── OpenCode-specific fields ──
+
+  if (oc) {
+    if (oc.smallModel)                config.small_model = oc.smallModel;
+    if (oc.defaultAgent)              config.default_agent = oc.defaultAgent;
+    if (oc.instructions)              config.instructions = oc.instructions;
+    if (oc.agent)                     config.agent = oc.agent;
+    if (oc.plugin)                    config.plugin = oc.plugin;
+    if (oc.disabledProviders)         config.disabled_providers = oc.disabledProviders;
+    if (oc.compaction)                config.compaction = oc.compaction;
+    if (oc.snapshot !== undefined)    config.snapshot = oc.snapshot;
+    if (oc.formatter)                 config.formatter = oc.formatter;
+    if (oc.autoupdate !== undefined)  config.autoupdate = oc.autoupdate;
+    if (oc.share)                     config.share = oc.share;
+    if (oc.tools)                     config.tools = oc.tools;
+    if (oc.watcher)                   config.watcher = oc.watcher;
   }
+
+  // ── 3-way deep merge: defaults ← existing template ← dynamic config ──
+
+  const filePath = path.join(dir, 'opencode.json');
+  let merged: Record<string, unknown>;
+
+  if (fs.existsSync(filePath)) {
+    const existing = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    merged = deepMerge(deepMerge(OPENCODE_CONTAINER_DEFAULTS, existing), config);
+  } else {
+    merged = deepMerge(OPENCODE_CONTAINER_DEFAULTS, config);
+  }
+
+  fs.writeFileSync(filePath, JSON.stringify(merged, null, 2));
 }
 
 function injectClaude(configDir: string, options: RuntimeConfigOptions): void {

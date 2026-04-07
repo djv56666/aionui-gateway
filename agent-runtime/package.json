@@ -6,7 +6,13 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "dev": "tsx watch index.js"
+    "dev": "tsx watch index.js",
+    "build:opencode": "docker build -t aionui-runtime-opencode:latest -f images/opencode/Dockerfile .",
+    "build:claude": "docker build -t aionui-runtime-claude:latest -f images/claude/Dockerfile .",
+    "build:codex": "docker build -t aionui-runtime-codex:latest -f images/codex/Dockerfile .",
+    "build:goose": "docker build -t aionui-runtime-goose:latest -f images/goose/Dockerfile .",
+    "build:openclaw": "docker build -t aionui-runtime-openclaw:latest -f images/openclaw/Dockerfile .",
+    "build:all": "npm run build:opencode && npm run build:claude && npm run build:codex && npm run build:goose && npm run build:openclaw"
   },
   "dependencies": {
     "express": "^4.18.2",

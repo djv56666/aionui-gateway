@@ -11,6 +11,13 @@
  */
 
 import { AgentSidecar } from './sidecar/agent-sidecar.js';
+import { readFileSync } from 'fs';
+import { fileURLToPath } from 'url';
+import { dirname, join } from 'path';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+const pkg = JSON.parse(readFileSync(join(__dirname, 'package.json'), 'utf8'));
 
 const transport = process.env.TRANSPORT_MODE || 'stdio';
 
@@ -23,6 +30,7 @@ const config = {
   heartbeatInterval: parseInt(process.env.HEARTBEAT_INTERVAL || '30000'),
   gatewayUrl: process.env.GATEWAY_URL || 'http://gateway:3000',
   gatewaySecret: process.env.GATEWAY_SECRET || '',
+  version: pkg.version,
   // Runtime CLI config (used by both transport modes)
   runtimeCli: process.env.RUNTIME_CLI || undefined,
   runtimeArgs: process.env.RUNTIME_ARGS || undefined,
